@@ -1,0 +1,41 @@
+# Runs every day at 05:00 CET (04:00 UTC in winter / CET).
+# During CEST (UTC+2) this is 06:00 local — cron is UTC-only on GitHub Actions.
+name: Daily Steam discovery
+
+on:
+  schedule:
+    - cron: "0 4 * * *" # 05:00 CET
+  workflow_dispatch: # allow manual "Run workflow" from the Actions tab
+
+permissions:
+  contents: write
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Restore & run
+        run: |
+          mkdir -p data
+          dotnet restore
+          dotnet run --configuration Release --no-launch-profile -- data/gamelist.json data/new_today.json
+
+      - name: Commit results
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/gamelist.json data/new_today.json data/new_*.json
+          if git diff --staged --quiet; then
+            echo "No file changes to commit."
+            exit 0
+          fi
+          git commit -m "chore: daily Steam discovery $(date -u +%Y-%m-%d)"
+          git push

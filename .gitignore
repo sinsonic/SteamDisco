@@ -1,0 +1,14 @@
+bin/
+obj/
+.dotnet-home/
+*.user
+*.suo
+.DS_Store
+
+# Large source CSV (gamelist.json is the runtime source of truth)
+games-list-dataset-*.csv
+
+# Local backups / legacy stores
+data/*.backup.json
+data/steam_games.json
+data/new_games_latest.json
