@@ -3,7 +3,8 @@
 // 1) Ask Steam which apps changed since the last run (PICS, anonymous).
 // 2) Look up each unknown app (Game, DLC, Demo, …).
 // 3) If its Steam ID (or name) is already in gamelist.json → ignore.
-// 4) Otherwise append it to gamelist.json with created_at, and refresh the daily view.
+// 4) Otherwise enrich from Steam Store (tags, categories, followers when available),
+//    append to gamelist.json with created_at, and refresh the daily view.
 //
 // The main archive is gamelist.json (filter by created_at anytime).
 // latestPath (e.g. new_today.json) is rewritten each run as "everything with
@@ -14,11 +15,13 @@
 //   SteamNewApps <gamelistPath> <latestPath>
 //   SteamNewApps --import-csv <csvPath> <gamelistPath>   # one-shot CSV → JSON
 //
-// gamelist.json: { "meta": {…}, "games": { "<id>": { name, type, created_at?, … } } }
+// gamelist.json: { "meta": {…}, "games": { "<id>": { name, type, tags, categories, followers?, created_at?, … } } }
 // First Steam run only baselines the change number and reports nothing.
 
 using System.Globalization;
+using System.Net.Http.Headers;
 using System.Text;
+using System.Text.Json;
 using System.Text.Json.Nodes;
 using SteamKit2;
 
@@ -58,6 +61,70 @@ static void SaveJson(string path, JsonObject root)
     File.WriteAllText(tmp, root.ToJsonString());
     File.Move(tmp, path, true);
 }
+
+static JsonArray ToJsonArray(IEnumerable<string> items)
+{
+    var arr = new JsonArray();
+    foreach (var s in items) arr.Add(s);
+    return arr;
+}
+
+// Steam store category ids → display names (player modes + common features).
+// Source: Steamworks store category documentation.
+var CategoryNames = new Dictionary<int, string>
+{
+    [1] = "Multi-player",
+    [2] = "Single-player",
+    [8] = "Valve Anti-Cheat enabled",
+    [9] = "Co-op",
+    [13] = "Captions available",
+    [14] = "Commentary available",
+    [15] = "Stats",
+    [16] = "Includes Source SDK",
+    [17] = "Includes level editor",
+    [18] = "Partial Controller Support",
+    [20] = "MMO",
+    [22] = "Steam Achievements",
+    [23] = "Steam Cloud",
+    [24] = "Shared/Split Screen",
+    [25] = "Steam Leaderboards",
+    [27] = "Cross-Platform Multiplayer",
+    [28] = "Full controller support",
+    [29] = "Steam Trading Cards",
+    [30] = "Steam Workshop",
+    [35] = "In-App Purchases",
+    [36] = "Online PvP",
+    [37] = "Shared/Split Screen PvP",
+    [38] = "Online Co-op",
+    [39] = "Shared/Split Screen Co-op",
+    [40] = "SteamVR Collectibles",
+    [41] = "Remote Play on Phone",
+    [42] = "Remote Play on Tablet",
+    [43] = "Remote Play on TV",
+    [44] = "Remote Play Together",
+    [47] = "LAN PvP",
+    [48] = "LAN Co-op",
+    [49] = "Shared/Split Screen",
+    [51] = "Steam Workshop",
+    [52] = "Tracked Controller Support",
+    [53] = "VR Supported",
+    [54] = "VR Only",
+    [61] = "HDR available",
+    [62] = "Family Sharing",
+    [63] = "Steam Timeline",
+    [64] = "Adjustable Text Size",
+    [65] = "Keyboard Only Option",
+    [66] = "Color Alternatives",
+    [67] = "Camera Comfort",
+    [68] = "Custom Volume Controls",
+    [69] = "Stereo Sound",
+    [70] = "Surround Sound",
+    [71] = "Narrated Game Menus",
+    [72] = "Playable without Timed Input",
+    [73] = "Save Anytime",
+    [74] = "Playable without Timed Input",
+    [75] = "Camera Comfort",
+};
 
 // ---------- CSV → gamelist.json ----------
 if (args is ["--import-csv", var csvPath, var outPath])
@@ -156,6 +223,7 @@ if (args.Length < 2)
 var gamelistPath = Path.GetFullPath(args[0]);
 var latestPath = Path.GetFullPath(args[1]);
 const int BatchSize = 200;
+const int StoreBatchSize = 50;
 var jobTimeout = TimeSpan.FromSeconds(90);
 
 // ---------- load gamelist ----------
@@ -173,7 +241,6 @@ var meta = GetOrAdd(root, "meta");
 var games = GetOrAdd(root, "games");
 var lastChange = (uint)(meta["changeNumber"]?.GetValue<long>() ?? 0);
 
-// name → first known id (for "already in list by name?" checks)
 var names = new Dictionary<string, string>(StringComparer.Ordinal);
 foreach (var (id, node) in games)
 {
@@ -188,6 +255,201 @@ void SaveGamelist()
     meta["count"] = games.Count;
     meta["last_run"] = DateTime.UtcNow.ToString("o");
     SaveJson(gamelistPath, root);
+}
+
+using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(60) };
+http.DefaultRequestHeaders.UserAgent.ParseAdd("SteamDisco/1.0 (+https://github.com/sinsonic/SteamDisco)");
+http.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+
+async Task<Dictionary<int, string>> LoadTagNamesAsync()
+{
+    var map = new Dictionary<int, string>();
+    try
+    {
+        var json = await http.GetStringAsync(
+            "https://api.steampowered.com/IStoreService/GetTagList/v1/?language=english");
+        var doc = JsonNode.Parse(json);
+        if (doc?["response"]?["tags"] is JsonArray tags)
+        {
+            foreach (var t in tags.OfType<JsonObject>())
+            {
+                var id = t["tagid"]?.GetValue<int>() ?? 0;
+                var name = t["name"]?.GetValue<string>();
+                if (id > 0 && !string.IsNullOrEmpty(name)) map[id] = name;
+            }
+        }
+        Console.WriteLine($"Loaded {map.Count} Steam tag names.");
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine("WARNING: could not load Steam tag list: " + ex.Message);
+    }
+    return map;
+}
+
+async Task<Dictionary<string, JsonObject>> FetchStoreItemsAsync(IReadOnlyList<uint> appIds, Dictionary<int, string> tagNames)
+{
+    var result = new Dictionary<string, JsonObject>();
+    if (appIds.Count == 0) return result;
+
+    for (var i = 0; i < appIds.Count; i += StoreBatchSize)
+    {
+        var batch = appIds.Skip(i).Take(StoreBatchSize).ToList();
+        var payload = new
+        {
+            ids = batch.Select(id => new { appid = id }).ToArray(),
+            context = new { language = "english", country_code = "US" },
+            data_request = new
+            {
+                include_basic_info = true,
+                include_tag_count = 20,
+                include_categories = true,
+                include_reviews = true,
+            },
+        };
+        var url = "https://api.steampowered.com/IStoreBrowseService/GetItems/v1/?input_json=" +
+                  Uri.EscapeDataString(JsonSerializer.Serialize(payload));
+
+        try
+        {
+            var json = await http.GetStringAsync(url);
+            var doc = JsonNode.Parse(json);
+            var items = doc?["response"]?["store_items"] as JsonArray;
+            if (items == null) continue;
+
+            foreach (var item in items.OfType<JsonObject>())
+            {
+                var appId = item["appid"]?.GetValue<int>()
+                            ?? item["id"]?.GetValue<int>()
+                            ?? 0;
+                if (appId == 0) continue;
+                var id = appId.ToString();
+
+                var tagList = new List<(int id, int weight)>();
+                if (item["tags"] is JsonArray tags)
+                {
+                    foreach (var t in tags.OfType<JsonObject>())
+                    {
+                        var tid = t["tagid"]?.GetValue<int>() ?? 0;
+                        var weight = t["weight"]?.GetValue<int>() ?? 0;
+                        if (tid > 0) tagList.Add((tid, weight));
+                    }
+                }
+                tagList.Sort((a, b) => b.weight.CompareTo(a.weight));
+                var tagNamesResolved = tagList
+                    .Select(t => tagNames.TryGetValue(t.id, out var n) ? n : null)
+                    .Where(n => !string.IsNullOrEmpty(n))
+                    .Cast<string>()
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+
+                var categoryIds = new List<int>();
+                if (item["categories"] is JsonObject cats)
+                {
+                    foreach (var key in new[] { "supported_player_categoryids", "feature_categoryids" })
+                    {
+                        if (cats[key] is not JsonArray arr) continue;
+                        foreach (var n in arr)
+                        {
+                            if (n != null && n.GetValueKind() == JsonValueKind.Number)
+                                categoryIds.Add(n.GetValue<int>());
+                        }
+                    }
+                }
+                var categoryNames = categoryIds
+                    .Distinct()
+                    .Select(cid => CategoryNames.TryGetValue(cid, out var n) ? n : $"Category {cid}")
+                    .ToList();
+
+                // Prefer player-facing categories first in the list.
+                categoryNames = categoryNames
+                    .OrderBy(c => c.StartsWith("Category ", StringComparison.Ordinal) ? 1 : 0)
+                    .ThenBy(c => c, StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+
+                long? followers = null; // Steam does not expose app follower counts via public API
+
+                var row = new JsonObject
+                {
+                    ["tags"] = ToJsonArray(tagNamesResolved),
+                    ["categories"] = ToJsonArray(categoryNames),
+                    ["followers"] = followers,
+                };
+
+                if (item["basic_info"] is JsonObject basic)
+                {
+                    if (basic["short_description"]?.GetValue<string>() is { Length: > 0 } desc)
+                        row["short_description"] = desc;
+                    if (basic["developers"] is JsonArray devs)
+                    {
+                        var namesArr = new JsonArray();
+                        foreach (var d in devs.OfType<JsonObject>())
+                            if (d["name"]?.GetValue<string>() is { Length: > 0 } dn)
+                                namesArr.Add(dn);
+                        if (namesArr.Count > 0) row["developers"] = namesArr;
+                    }
+                    if (basic["publishers"] is JsonArray pubs)
+                    {
+                        var namesArr = new JsonArray();
+                        foreach (var p in pubs.OfType<JsonObject>())
+                            if (p["name"]?.GetValue<string>() is { Length: > 0 } pn)
+                                namesArr.Add(pn);
+                        if (namesArr.Count > 0) row["publishers"] = namesArr;
+                    }
+                }
+
+                if (item["reviews"]?["summary_filtered"] is JsonObject rev)
+                {
+                    row["review_count"] = rev["review_count"]?.DeepClone();
+                    row["review_score_label"] = rev["review_score_label"]?.DeepClone();
+                    row["percent_positive"] = rev["percent_positive"]?.DeepClone();
+                }
+
+                result[id] = row;
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"WARNING: store enrich batch failed: {ex.Message}");
+        }
+
+        if (i + StoreBatchSize < appIds.Count)
+            await Task.Delay(200);
+    }
+
+    return result;
+}
+
+void ApplyEnrichment(JsonObject target, JsonObject enrich)
+{
+    foreach (var key in new[] { "tags", "categories", "short_description",
+                 "developers", "publishers", "review_count", "review_score_label", "percent_positive" })
+    {
+        if (enrich[key] != null)
+            target[key] = enrich[key]!.DeepClone();
+    }
+    // Always set followers (often null — Steam does not expose this publicly).
+    target["followers"] = enrich["followers"]?.DeepClone();
+}
+
+JsonObject PublicRow(string id, JsonObject g)
+{
+    var row = new JsonObject
+    {
+        ["id"] = id,
+        ["name"] = g["name"]?.GetValue<string>() ?? "",
+        ["type"] = g["type"]?.GetValue<string>() ?? "",
+        ["release_state"] = g["release_state"]?.GetValue<string>(),
+        ["release_date"] = g["released"]?.GetValue<string>(),
+        ["created_at"] = g["created_at"]?.GetValue<string>() ?? g["first_seen_at"]?.GetValue<string>(),
+        ["store_url"] = "https://store.steampowered.com/app/" + id,
+    };
+    foreach (var key in new[] { "tags", "categories", "followers", "short_description",
+                 "developers", "publishers", "review_count", "review_score_label", "percent_positive" })
+    {
+        if (g[key] != null) row[key] = g[key]!.DeepClone();
+    }
+    return row;
 }
 
 // ---------- connect to Steam ----------
@@ -266,7 +528,7 @@ try
     Console.WriteLine($"Change {lastChange} -> {changes.CurrentChangeNumber}: " +
                       $"{changes.AppChanges.Count} apps changed, {candidates.Count} not in gamelist by ID.");
 
-    var found = new List<JsonObject>();
+    var foundIds = new List<uint>();
     var skippedByName = 0;
     var now = DateTime.UtcNow.ToString("o");
 
@@ -294,7 +556,7 @@ try
                 if (common is null || common == KeyValue.Invalid) continue;
                 var type = Kv(common, "type");
                 if (string.IsNullOrEmpty(type))
-                    continue; // hidden / token-gated: retry when it changes again
+                    continue;
 
                 var id = appId.ToString();
                 if (games.ContainsKey(id)) continue;
@@ -303,8 +565,6 @@ try
                 var norm = NormName(name);
                 if (norm.Length > 0 && names.ContainsKey(norm))
                 {
-                    // Same title already in gamelist under another id — record id so we
-                    // don't re-check it, but don't treat it as a new page (no created_at).
                     games[id] = new JsonObject
                     {
                         ["name"] = name,
@@ -327,33 +587,52 @@ try
                     ["release_state"] = releaseState,
                     ["released"] = releaseDate,
                     ["source"] = "pics",
-                    ["created_at"] = now, // when we first added it to gamelist
+                    ["created_at"] = now,
                 };
                 if (norm.Length > 0) names.TryAdd(norm, id);
-
-                found.Add(new JsonObject
-                {
-                    ["id"] = id,
-                    ["name"] = name,
-                    ["type"] = type,
-                    ["release_state"] = releaseState,
-                    ["release_date"] = releaseDate,
-                    ["created_at"] = now,
-                    ["store_url"] = "https://store.steampowered.com/app/" + id,
-                });
+                foundIds.Add(appId);
                 Console.WriteLine($"  + [{type}] {name} ({id})");
             }
         }
         Console.WriteLine($"  checked {Math.Min(i + BatchSize, candidates.Count)}/{candidates.Count}");
     }
 
+    // Also backfill store details for anything created today that still lacks tags.
+    var today = DateTime.UtcNow.Date;
+    var todayStr = today.ToString("yyyy-MM-dd");
+    var needEnrich = new HashSet<uint>(foundIds);
+    foreach (var (id, node) in games)
+    {
+        if (node is not JsonObject g) continue;
+        var created = g["created_at"]?.GetValue<string>() ?? g["first_seen_at"]?.GetValue<string>();
+        if (string.IsNullOrEmpty(created)) continue;
+        if (!DateTimeOffset.TryParse(created, CultureInfo.InvariantCulture,
+                DateTimeStyles.RoundtripKind, out var when) || when.UtcDateTime.Date != today)
+            continue;
+        if (g["tags"] is JsonArray { Count: > 0 }) continue;
+        if (uint.TryParse(id, out var uid)) needEnrich.Add(uid);
+    }
+
+    if (needEnrich.Count > 0)
+    {
+        Console.WriteLine($"Enriching {needEnrich.Count} app(s) with Steam Store tags/categories...");
+        var tagNames = await LoadTagNamesAsync();
+        var enrich = await FetchStoreItemsAsync(needEnrich.ToList(), tagNames);
+        foreach (var (id, data) in enrich)
+        {
+            if (games[id] is not JsonObject g) continue;
+            ApplyEnrichment(g, data);
+            var tagCount = (g["tags"] as JsonArray)?.Count ?? 0;
+            var catCount = (g["categories"] as JsonArray)?.Count ?? 0;
+            Console.WriteLine($"    {id}: {tagCount} tags, {catCount} categories");
+        }
+        Console.WriteLine($"Store details applied to {enrich.Count}/{needEnrich.Count} app(s).");
+        Console.WriteLine("Note: Steam does not publish app follower counts via public API; followers stays null.");
+    }
+
     meta["changeNumber"] = (long)changes.CurrentChangeNumber;
     SaveGamelist();
 
-    // Daily view = everything in gamelist with created_at on today's UTC date
-    // (accumulates across same-day runs; next UTC day starts empty).
-    var today = DateTime.UtcNow.Date;
-    var todayStr = today.ToString("yyyy-MM-dd");
     var todayRows = new List<JsonObject>();
     foreach (var (id, node) in games)
     {
@@ -364,17 +643,7 @@ try
                 DateTimeStyles.RoundtripKind, out var when))
             continue;
         if (when.UtcDateTime.Date != today) continue;
-
-        todayRows.Add(new JsonObject
-        {
-            ["id"] = id,
-            ["name"] = g["name"]?.GetValue<string>() ?? "",
-            ["type"] = g["type"]?.GetValue<string>() ?? "",
-            ["release_state"] = g["release_state"]?.GetValue<string>(),
-            ["release_date"] = g["released"]?.GetValue<string>(),
-            ["created_at"] = created,
-            ["store_url"] = "https://store.steampowered.com/app/" + id,
-        });
+        todayRows.Add(PublicRow(id, g));
     }
 
     todayRows = todayRows
@@ -394,7 +663,7 @@ try
         ["generated_at"] = DateTime.UtcNow.ToString("o"),
         ["date"] = todayStr,
         ["count"] = todayRows.Count,
-        ["new_this_run"] = found.Count,
+        ["new_this_run"] = foundIds.Count,
         ["skipped_name_match"] = skippedByName,
         ["by_type"] = new JsonObject(byType.ToDictionary(
             kv => kv.Key,
@@ -407,11 +676,10 @@ try
     File.WriteAllText(latestTmp, digest.ToJsonString());
     File.Move(latestTmp, latestPath, true);
 
-    // Keep a dated snapshot so tomorrow's rewrite of new_today.json does not lose history.
     var datedPath = Path.Combine(Path.GetDirectoryName(latestPath)!, $"new_{todayStr}.json");
     File.Copy(latestPath, datedPath, true);
 
-    Console.WriteLine($"Done. {found.Count} new this run; {todayRows.Count} total with created_at={todayStr}." +
+    Console.WriteLine($"Done. {foundIds.Count} new this run; {todayRows.Count} total with created_at={todayStr}." +
                       (skippedByName > 0 ? $" ({skippedByName} skipped, name already known)" : "") +
                       $" Gamelist: {games.Count} apps.");
     foreach (var (type, count) in byType.OrderByDescending(kv => kv.Value)
