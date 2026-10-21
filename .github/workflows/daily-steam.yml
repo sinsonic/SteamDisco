@@ -1,10 +1,13 @@
-# Runs every day at 05:00 CET (04:00 UTC in winter / CET).
-# During CEST (UTC+2) this is 06:00 local — cron is UTC-only on GitHub Actions.
+# Steam only keeps a short PICS change history, so we run several times a day.
+# GitHub cron is UTC-only (delays of 1–3h are normal).
 name: Daily Steam discovery
 
 on:
   schedule:
-    - cron: "0 4 * * *" # 05:00 CET
+    - cron: "0 4 * * *"  # ~05:00 CET
+    - cron: "0 10 * * *" # ~11:00 CET
+    - cron: "0 16 * * *" # ~17:00 CET
+    - cron: "0 22 * * *" # ~23:00 CET
   workflow_dispatch: # allow manual "Run workflow" from the Actions tab
 
 permissions:
@@ -23,19 +26,27 @@ jobs:
           dotnet-version: "8.0.x"
 
       - name: Restore & run
+        id: discover
+        continue-on-error: true
         run: |
           mkdir -p data
           dotnet restore
           dotnet run --configuration Release --no-launch-profile -- data/gamelist.json data/new_today.json
 
       - name: Commit results
+        if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add data/gamelist.json data/new_today.json data/new_*.json
           if git diff --staged --quiet; then
             echo "No file changes to commit."
-            exit 0
+          else
+            git commit -m "chore: daily Steam discovery $(date -u +%Y-%m-%d)"
+            git push
           fi
-          git commit -m "chore: daily Steam discovery $(date -u +%Y-%m-%d)"
-          git push
+          # Fail the job if the discover step failed for a non-baseline reason
+          if [ "${{ steps.discover.outcome }}" != "success" ]; then
+            echo "Discover step outcome: ${{ steps.discover.outcome }}"
+            exit 1
+          fi

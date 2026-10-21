@@ -513,13 +513,73 @@ try
     changesJob.Timeout = jobTimeout;
     var changes = await changesJob.ToTask();
 
+    void WriteTodayDigest(int newThisRun, int skippedNameMatch)
+    {
+        var day = DateTime.UtcNow.Date;
+        var dayStr = day.ToString("yyyy-MM-dd");
+        var todayRows = new List<JsonObject>();
+        foreach (var (id, node) in games)
+        {
+            if (node is not JsonObject g) continue;
+            var created = g["created_at"]?.GetValue<string>() ?? g["first_seen_at"]?.GetValue<string>();
+            if (string.IsNullOrEmpty(created)) continue;
+            if (!DateTimeOffset.TryParse(created, CultureInfo.InvariantCulture,
+                    DateTimeStyles.RoundtripKind, out var when))
+                continue;
+            if (when.UtcDateTime.Date != day) continue;
+            todayRows.Add(PublicRow(id, g));
+        }
+
+        todayRows = todayRows
+            .OrderBy(a => a["type"]?.GetValue<string>() ?? "", StringComparer.OrdinalIgnoreCase)
+            .ThenBy(a => a["name"]?.GetValue<string>() ?? "", StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        var byType = todayRows
+            .GroupBy(a => a["type"]?.GetValue<string>() ?? "Unknown")
+            .ToDictionary(g => g.Key, g => g.Count());
+
+        var appsArr = new JsonArray();
+        foreach (var row in todayRows) appsArr.Add(row);
+
+        var digest = new JsonObject
+        {
+            ["generated_at"] = DateTime.UtcNow.ToString("o"),
+            ["date"] = dayStr,
+            ["count"] = todayRows.Count,
+            ["new_this_run"] = newThisRun,
+            ["skipped_name_match"] = skippedNameMatch,
+            ["by_type"] = new JsonObject(byType.ToDictionary(
+                kv => kv.Key,
+                kv => (JsonNode?)JsonValue.Create(kv.Value))),
+            ["apps"] = appsArr,
+        };
+
+        Directory.CreateDirectory(Path.GetDirectoryName(latestPath)!);
+        var latestTmp = latestPath + ".tmp";
+        File.WriteAllText(latestTmp, digest.ToJsonString());
+        File.Move(latestTmp, latestPath, true);
+
+        var datedPath = Path.Combine(Path.GetDirectoryName(latestPath)!, $"new_{dayStr}.json");
+        File.Copy(latestPath, datedPath, true);
+
+        Console.WriteLine($"Today ({dayStr} UTC): {todayRows.Count} app(s) with created_at today.");
+        foreach (var (type, count) in byType.OrderByDescending(kv => kv.Value)
+                     .ThenBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase))
+            Console.WriteLine($"  {type}: {count}");
+        Console.WriteLine($"Wrote {latestPath} and {datedPath}");
+    }
+
     if (changes.RequiresFullAppUpdate || changes.RequiresFullUpdate)
     {
+        // Steam only keeps a short change history. Exit 0 so CI still commits the
+        // new baseline — otherwise the next run hits the same stale change number.
         meta["changeNumber"] = (long)changes.CurrentChangeNumber;
         SaveGamelist();
+        WriteTodayDigest(0, 0);
         Console.Error.WriteLine($"WARNING: last change number {lastChange} is too old for Steam to list changes. " +
                                 $"Re-baselined at {changes.CurrentChangeNumber}; apps created in the gap were missed.");
-        return await Shutdown(2);
+        return await Shutdown(0);
     }
 
     var candidates = changes.AppChanges.Keys
@@ -599,7 +659,6 @@ try
 
     // Also backfill store details for anything created today that still lacks tags.
     var today = DateTime.UtcNow.Date;
-    var todayStr = today.ToString("yyyy-MM-dd");
     var needEnrich = new HashSet<uint>(foundIds);
     foreach (var (id, node) in games)
     {
@@ -632,60 +691,10 @@ try
 
     meta["changeNumber"] = (long)changes.CurrentChangeNumber;
     SaveGamelist();
-
-    var todayRows = new List<JsonObject>();
-    foreach (var (id, node) in games)
-    {
-        if (node is not JsonObject g) continue;
-        var created = g["created_at"]?.GetValue<string>() ?? g["first_seen_at"]?.GetValue<string>();
-        if (string.IsNullOrEmpty(created)) continue;
-        if (!DateTimeOffset.TryParse(created, CultureInfo.InvariantCulture,
-                DateTimeStyles.RoundtripKind, out var when))
-            continue;
-        if (when.UtcDateTime.Date != today) continue;
-        todayRows.Add(PublicRow(id, g));
-    }
-
-    todayRows = todayRows
-        .OrderBy(a => a["type"]?.GetValue<string>() ?? "", StringComparer.OrdinalIgnoreCase)
-        .ThenBy(a => a["name"]?.GetValue<string>() ?? "", StringComparer.OrdinalIgnoreCase)
-        .ToList();
-
-    var byType = todayRows
-        .GroupBy(a => a["type"]?.GetValue<string>() ?? "Unknown")
-        .ToDictionary(g => g.Key, g => g.Count());
-
-    var appsArr = new JsonArray();
-    foreach (var row in todayRows) appsArr.Add(row);
-
-    var digest = new JsonObject
-    {
-        ["generated_at"] = DateTime.UtcNow.ToString("o"),
-        ["date"] = todayStr,
-        ["count"] = todayRows.Count,
-        ["new_this_run"] = foundIds.Count,
-        ["skipped_name_match"] = skippedByName,
-        ["by_type"] = new JsonObject(byType.ToDictionary(
-            kv => kv.Key,
-            kv => (JsonNode?)JsonValue.Create(kv.Value))),
-        ["apps"] = appsArr,
-    };
-
-    Directory.CreateDirectory(Path.GetDirectoryName(latestPath)!);
-    var latestTmp = latestPath + ".tmp";
-    File.WriteAllText(latestTmp, digest.ToJsonString());
-    File.Move(latestTmp, latestPath, true);
-
-    var datedPath = Path.Combine(Path.GetDirectoryName(latestPath)!, $"new_{todayStr}.json");
-    File.Copy(latestPath, datedPath, true);
-
-    Console.WriteLine($"Done. {foundIds.Count} new this run; {todayRows.Count} total with created_at={todayStr}." +
+    WriteTodayDigest(foundIds.Count, skippedByName);
+    Console.WriteLine($"Done. {foundIds.Count} new this run." +
                       (skippedByName > 0 ? $" ({skippedByName} skipped, name already known)" : "") +
                       $" Gamelist: {games.Count} apps.");
-    foreach (var (type, count) in byType.OrderByDescending(kv => kv.Value)
-                 .ThenBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase))
-        Console.WriteLine($"  {type}: {count}");
-    Console.WriteLine($"Wrote {latestPath} and {datedPath}");
 
     return await Shutdown(0);
 }
